@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -26,6 +27,14 @@ var opencodeGoBaseURL = "https://opencode.ai/zen/go/v1"
 var opencodeGoMessagesModels = map[string]struct{}{
 	"minimax-m2.7": {},
 	"minimax-m2.5": {},
+}
+
+var opencodeGoKnownNativeVisionModels = map[string]struct{}{
+	"qwen3.5-plus":  {},
+	"qwen3.6-plus":  {},
+	"mimo-v2-omni":  {},
+	"mimo-v2.5":     {},
+	"mimo-v2.5-pro": {},
 }
 
 // OpenCodeGoExecutor routes OpenCode Go models to the provider's mixed OpenAI/Anthropic endpoints.
@@ -70,17 +79,42 @@ func (e *OpenCodeGoExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth
 }
 
 func (e *OpenCodeGoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	if opencodeGoUsesMessages(req.Model) {
-		return e.executeMessages(ctx, auth, req, opts)
+	fallback := e.applyVisionFallback(auth, req, opts)
+	req = fallback.Request
+	if !fallback.Applied {
+		req = e.sanitizeHistoricalImagesForTextModel(req)
 	}
-	return e.openAIExecutor().Execute(ctx, opencodeGoAuthWithBaseURL(auth), req, opts)
+	var resp cliproxyexecutor.Response
+	var err error
+	if opencodeGoUsesMessages(req.Model) {
+		resp, err = e.executeMessages(ctx, auth, req, opts)
+	} else {
+		resp, err = e.openAIExecutor().Execute(ctx, opencodeGoAuthWithBaseURL(auth), req, opts)
+	}
+	if err != nil || !fallback.Applied {
+		return resp, err
+	}
+	resp.Payload = opencodeGoRewriteFallbackResponseModel(resp.Payload, fallback.OriginalModel)
+	return resp, nil
 }
 
 func (e *OpenCodeGoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	if opencodeGoUsesMessages(req.Model) {
-		return e.executeMessagesStream(ctx, auth, req, opts)
+	fallback := e.applyVisionFallback(auth, req, opts)
+	req = fallback.Request
+	if !fallback.Applied {
+		req = e.sanitizeHistoricalImagesForTextModel(req)
 	}
-	return e.openAIExecutor().ExecuteStream(ctx, opencodeGoAuthWithBaseURL(auth), req, opts)
+	var result *cliproxyexecutor.StreamResult
+	var err error
+	if opencodeGoUsesMessages(req.Model) {
+		result, err = e.executeMessagesStream(ctx, auth, req, opts)
+	} else {
+		result, err = e.openAIExecutor().ExecuteStream(ctx, opencodeGoAuthWithBaseURL(auth), req, opts)
+	}
+	if err != nil || !fallback.Applied {
+		return result, err
+	}
+	return opencodeGoRewriteFallbackStreamResult(result, fallback.OriginalModel), nil
 }
 
 func (e *OpenCodeGoExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
@@ -97,6 +131,498 @@ func (e *OpenCodeGoExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Aut
 
 func (e *OpenCodeGoExecutor) openAIExecutor() *OpenAICompatExecutor {
 	return NewOpenAICompatExecutor(openCodeGoProvider, e.cfg)
+}
+
+type opencodeGoVisionFallbackResult struct {
+	Request       cliproxyexecutor.Request
+	OriginalModel string
+	FallbackModel string
+	Applied       bool
+}
+
+func (e *OpenCodeGoExecutor) applyVisionFallback(auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) opencodeGoVisionFallbackResult {
+	result := opencodeGoVisionFallbackResult{
+		Request:       req,
+		OriginalModel: payloadRequestedModel(opts, req.Model),
+	}
+	fallback := opencodeGoVisionFallbackModel(e.cfg, auth)
+	if fallback == "" || !opencodeGoCurrentRequestHasImage(req.Payload) {
+		return result
+	}
+	if !opencodeGoSupportsNativeVision(fallback) {
+		return result
+	}
+	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	if strings.EqualFold(baseModel, fallback) || opencodeGoSupportsNativeVision(baseModel) {
+		return result
+	}
+	req.Model = fallback
+	req.Payload, _ = sjson.SetBytes(req.Payload, "model", fallback)
+	if opencodeGoDisablesThinkingForVisionFallback(fallback) {
+		req.Payload, _ = sjson.SetBytes(req.Payload, "enable_thinking", false)
+	}
+	result.Request = req
+	result.FallbackModel = fallback
+	result.Applied = true
+	return result
+}
+
+func (e *OpenCodeGoExecutor) sanitizeHistoricalImagesForTextModel(req cliproxyexecutor.Request) cliproxyexecutor.Request {
+	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	if opencodeGoSupportsNativeVision(baseModel) {
+		return req
+	}
+	if opencodeGoCurrentRequestHasImage(req.Payload) || !opencodeGoPayloadHasImage(req.Payload) {
+		return req
+	}
+	if payload, ok := opencodeGoSanitizeHistoricalImages(req.Payload); ok {
+		req.Payload = payload
+	}
+	return req
+}
+
+func opencodeGoVisionFallbackModel(cfg *config.Config, auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Attributes != nil {
+		if fallback := strings.TrimSpace(auth.Attributes["vision_fallback_model"]); fallback != "" {
+			if opencodeGoModelExcluded(fallback, auth.Attributes["excluded_models"]) {
+				return ""
+			}
+			return fallback
+		}
+	}
+	if cfg == nil {
+		return ""
+	}
+	apiKey := ""
+	if auth.Attributes != nil {
+		apiKey = strings.TrimSpace(auth.Attributes["api_key"])
+	}
+	if apiKey == "" {
+		return ""
+	}
+	for i := range cfg.OpenCodeGoKey {
+		entry := &cfg.OpenCodeGoKey[i]
+		if strings.EqualFold(strings.TrimSpace(entry.APIKey), apiKey) {
+			fallback := strings.TrimSpace(entry.VisionFallbackModel)
+			if opencodeGoModelExcluded(fallback, strings.Join(entry.ExcludedModels, ",")) {
+				return ""
+			}
+			return fallback
+		}
+	}
+	return ""
+}
+
+func opencodeGoModelExcluded(model, excluded string) bool {
+	model = strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	if model == "" {
+		return true
+	}
+	for _, entry := range strings.Split(excluded, ",") {
+		entry = strings.ToLower(strings.TrimSpace(entry))
+		if entry == "" {
+			continue
+		}
+		if entry == "*" || entry == model {
+			return true
+		}
+	}
+	return false
+}
+
+func opencodeGoPayloadHasImage(payload []byte) bool {
+	if len(payload) == 0 || !json.Valid(payload) {
+		return false
+	}
+	var value any
+	if err := json.Unmarshal(payload, &value); err != nil {
+		return false
+	}
+	return opencodeGoValueHasImage(value)
+}
+
+func opencodeGoCurrentRequestHasImage(payload []byte) bool {
+	if len(payload) == 0 || !json.Valid(payload) {
+		return false
+	}
+	var value any
+	if err := json.Unmarshal(payload, &value); err != nil {
+		return false
+	}
+	if hasImage, recognized := opencodeGoCurrentValueHasImage(value); recognized {
+		return hasImage
+	}
+	return opencodeGoValueHasImage(value)
+}
+
+func opencodeGoSanitizeHistoricalImages(payload []byte) ([]byte, bool) {
+	if len(payload) == 0 || !json.Valid(payload) {
+		return payload, false
+	}
+	var root map[string]any
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return payload, false
+	}
+	changed := false
+	if messages, ok := root["messages"].([]any); ok {
+		if opencodeGoSanitizeMessageArray(messages) {
+			root["messages"] = messages
+			changed = true
+		}
+	}
+	if input, ok := root["input"]; ok {
+		if sanitized, ok := opencodeGoSanitizeResponsesInput(input); ok {
+			root["input"] = sanitized
+			changed = true
+		}
+	}
+	if !changed {
+		return payload, false
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return payload, false
+	}
+	return out, true
+}
+
+func opencodeGoSanitizeMessageArray(messages []any) bool {
+	changed := false
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		content, ok := message["content"]
+		if !ok {
+			continue
+		}
+		if sanitized, ok := opencodeGoSanitizeContentParts(content, "text"); ok {
+			message["content"] = sanitized
+			changed = true
+		}
+	}
+	return changed
+}
+
+func opencodeGoSanitizeResponsesInput(input any) (any, bool) {
+	switch typed := input.(type) {
+	case []any:
+		changed := false
+		for i, raw := range typed {
+			item, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if opencodeGoContentPartIsImage(item) {
+				typed[i] = opencodeGoImagePlaceholderPart("input_text")
+				changed = true
+				continue
+			}
+			content, ok := item["content"]
+			if !ok {
+				continue
+			}
+			if sanitized, ok := opencodeGoSanitizeContentParts(content, "input_text"); ok {
+				item["content"] = sanitized
+				changed = true
+			}
+		}
+		return typed, changed
+	case map[string]any:
+		if opencodeGoContentPartIsImage(typed) {
+			return opencodeGoImagePlaceholderPart("input_text"), true
+		}
+		content, ok := typed["content"]
+		if !ok {
+			return input, false
+		}
+		if sanitized, ok := opencodeGoSanitizeContentParts(content, "input_text"); ok {
+			typed["content"] = sanitized
+			return typed, true
+		}
+	}
+	return input, false
+}
+
+func opencodeGoSanitizeContentParts(content any, placeholderType string) (any, bool) {
+	parts, ok := content.([]any)
+	if !ok {
+		return content, false
+	}
+	changed := false
+	out := make([]any, 0, len(parts))
+	for _, part := range parts {
+		partMap, ok := part.(map[string]any)
+		if !ok || !opencodeGoContentPartIsImage(partMap) {
+			out = append(out, part)
+			continue
+		}
+		if !opencodeGoContentPartsHaveText(out) {
+			out = append(out, opencodeGoImagePlaceholderPart(placeholderType))
+		}
+		changed = true
+	}
+	if !changed {
+		return content, false
+	}
+	if len(out) == 0 {
+		out = append(out, opencodeGoImagePlaceholderPart(placeholderType))
+	}
+	return out, true
+}
+
+func opencodeGoContentPartIsImage(part map[string]any) bool {
+	rawType, _ := part["type"].(string)
+	switch strings.ToLower(strings.TrimSpace(rawType)) {
+	case "image", "image_url", "input_image":
+		return true
+	}
+	_, ok := part["image_url"]
+	return ok
+}
+
+func opencodeGoContentPartsHaveText(parts []any) bool {
+	for _, part := range parts {
+		partMap, ok := part.(map[string]any)
+		if !ok {
+			continue
+		}
+		rawType, _ := partMap["type"].(string)
+		switch strings.ToLower(strings.TrimSpace(rawType)) {
+		case "text", "input_text", "output_text":
+			if text, _ := partMap["text"].(string); strings.TrimSpace(text) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func opencodeGoImagePlaceholderPart(partType string) map[string]any {
+	partType = strings.TrimSpace(partType)
+	if partType == "" {
+		partType = "text"
+	}
+	return map[string]any{
+		"type": partType,
+		"text": "[Image omitted from previous turn.]",
+	}
+}
+
+func opencodeGoCurrentValueHasImage(value any) (bool, bool) {
+	root, ok := value.(map[string]any)
+	if !ok {
+		return false, false
+	}
+	if messages, ok := root["messages"].([]any); ok {
+		return opencodeGoLatestUserMessageHasImage(messages)
+	}
+	if input, ok := root["input"]; ok {
+		return opencodeGoInputHasImage(input)
+	}
+	return false, false
+}
+
+func opencodeGoLatestUserMessageHasImage(messages []any) (bool, bool) {
+	for i := len(messages) - 1; i >= 0; i-- {
+		message, ok := messages[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := message["role"].(string)
+		if !strings.EqualFold(strings.TrimSpace(role), "user") {
+			continue
+		}
+		if content, ok := message["content"]; ok {
+			return opencodeGoValueHasImage(content), true
+		}
+		return opencodeGoValueHasImage(message), true
+	}
+	return false, false
+}
+
+func opencodeGoInputHasImage(input any) (bool, bool) {
+	switch typed := input.(type) {
+	case string:
+		return false, true
+	case map[string]any:
+		return opencodeGoValueHasImage(typed), true
+	case []any:
+		if hasImage, recognized := opencodeGoLatestUserInputItemHasImage(typed); recognized {
+			return hasImage, true
+		}
+		return opencodeGoValueHasImage(typed), true
+	default:
+		return false, false
+	}
+}
+
+func opencodeGoLatestUserInputItemHasImage(items []any) (bool, bool) {
+	sawRole := false
+	for i := len(items) - 1; i >= 0; i-- {
+		item, ok := items[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		role, ok := item["role"].(string)
+		if !ok {
+			continue
+		}
+		sawRole = true
+		if !strings.EqualFold(strings.TrimSpace(role), "user") {
+			continue
+		}
+		if content, ok := item["content"]; ok {
+			return opencodeGoValueHasImage(content), true
+		}
+		return opencodeGoValueHasImage(item), true
+	}
+	if sawRole {
+		return false, true
+	}
+	return false, false
+}
+
+func opencodeGoValueHasImage(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		if rawType, ok := typed["type"].(string); ok {
+			switch strings.ToLower(strings.TrimSpace(rawType)) {
+			case "image", "image_url", "input_image":
+				return true
+			}
+		}
+		if _, ok := typed["image_url"]; ok {
+			return true
+		}
+		for _, child := range typed {
+			if opencodeGoValueHasImage(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if opencodeGoValueHasImage(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func opencodeGoSupportsNativeVision(model string) bool {
+	baseModel := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	if baseModel == "" {
+		return false
+	}
+	if _, ok := opencodeGoKnownNativeVisionModels[baseModel]; ok {
+		return true
+	}
+	return opencodeGoModelNameImpliesVision(baseModel)
+}
+
+func opencodeGoModelNameImpliesVision(model string) bool {
+	if strings.Contains(model, "vision") ||
+		strings.Contains(model, "multimodal") ||
+		strings.Contains(model, "omni") {
+		return true
+	}
+	for _, token := range strings.FieldsFunc(model, func(r rune) bool {
+		return r == '-' || r == '_' || r == '.' || r == '/' || r == ':'
+	}) {
+		if token == "vl" {
+			return true
+		}
+	}
+	return false
+}
+
+func opencodeGoDisablesThinkingForVisionFallback(model string) bool {
+	baseModel := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	return strings.HasPrefix(baseModel, "qwen")
+}
+
+var opencodeGoFallbackModelFieldPaths = []string{
+	"model",
+	"modelVersion",
+	"message.model",
+	"response.model",
+	"response.modelVersion",
+}
+
+func opencodeGoRewriteFallbackResponseModel(data []byte, originalModel string) []byte {
+	originalModel = strings.TrimSpace(originalModel)
+	if originalModel == "" || len(data) == 0 || !gjson.ValidBytes(bytes.TrimSpace(data)) {
+		return data
+	}
+	out := data
+	for _, path := range opencodeGoFallbackModelFieldPaths {
+		if !gjson.GetBytes(out, path).Exists() {
+			continue
+		}
+		updated, err := sjson.SetBytes(out, path, originalModel)
+		if err == nil {
+			out = updated
+		}
+	}
+	return out
+}
+
+func opencodeGoRewriteFallbackStreamResult(result *cliproxyexecutor.StreamResult, originalModel string) *cliproxyexecutor.StreamResult {
+	if result == nil || strings.TrimSpace(originalModel) == "" {
+		return result
+	}
+	out := make(chan cliproxyexecutor.StreamChunk)
+	go func() {
+		defer close(out)
+		for chunk := range result.Chunks {
+			if chunk.Err == nil && len(chunk.Payload) > 0 {
+				chunk.Payload = opencodeGoRewriteFallbackStreamPayload(chunk.Payload, originalModel)
+			}
+			out <- chunk
+		}
+	}()
+	return &cliproxyexecutor.StreamResult{Headers: result.Headers, Chunks: out}
+}
+
+func opencodeGoRewriteFallbackStreamPayload(payload []byte, originalModel string) []byte {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 {
+		return payload
+	}
+	if gjson.ValidBytes(trimmed) {
+		return opencodeGoRewriteFallbackResponseModel(payload, originalModel)
+	}
+	lines := bytes.Split(payload, []byte("\n"))
+	modified := false
+	for i, line := range lines {
+		dataIdx := bytes.Index(line, []byte("data:"))
+		if dataIdx < 0 {
+			continue
+		}
+		raw := bytes.TrimSpace(line[dataIdx+len("data:"):])
+		if len(raw) == 0 || bytes.Equal(raw, []byte("[DONE]")) || !gjson.ValidBytes(raw) {
+			continue
+		}
+		rewritten := opencodeGoRewriteFallbackResponseModel(raw, originalModel)
+		if bytes.Equal(rewritten, raw) {
+			continue
+		}
+		rebuilt := make([]byte, 0, len(line)-len(raw)+len(rewritten)+1)
+		rebuilt = append(rebuilt, line[:dataIdx]...)
+		rebuilt = append(rebuilt, []byte("data: ")...)
+		rebuilt = append(rebuilt, rewritten...)
+		lines[i] = rebuilt
+		modified = true
+	}
+	if !modified {
+		return payload
+	}
+	return bytes.Join(lines, []byte("\n"))
 }
 
 func (e *OpenCodeGoExecutor) executeMessages(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
