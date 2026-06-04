@@ -79,6 +79,15 @@ type LogStats struct {
 	CacheRate   float64 `json:"cache_rate"`
 }
 
+const cacheRateEffectiveInputSQL = "CASE WHEN cached_tokens > input_tokens THEN input_tokens + cached_tokens ELSE input_tokens END"
+
+func cacheRateFromTokenTotals(effectiveInputTokens, cachedTokens int64) float64 {
+	if effectiveInputTokens <= 0 {
+		return 0
+	}
+	return float64(cachedTokens) / float64(effectiveInputTokens) * 100
+}
+
 type ClearRequestLogsResult struct {
 	DeletedLogs       int64 `json:"deleted_logs"`
 	DeletedContents   int64 `json:"deleted_contents"`
@@ -590,11 +599,11 @@ func QueryStats(params LogQueryParams) (LogStats, error) {
 
 	where, args := buildWhereClause(params)
 
-	var total, successCount, totalTokens, totalInputTokens, totalCachedTokens int64
+	var total, successCount, totalTokens, effectiveInputTokens, totalCachedTokens int64
 	var totalCost float64
-	statsSQL := "SELECT COUNT(*), COALESCE(SUM(CASE WHEN failed=0 THEN 1 ELSE 0 END),0), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost),0), COALESCE(SUM(CASE WHEN cached_tokens > input_tokens THEN input_tokens + cached_tokens ELSE input_tokens END),0), COALESCE(SUM(cached_tokens),0) " +
+	statsSQL := "SELECT COUNT(*), COALESCE(SUM(CASE WHEN failed=0 THEN 1 ELSE 0 END),0), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost),0), COALESCE(SUM(" + cacheRateEffectiveInputSQL + "),0), COALESCE(SUM(cached_tokens),0) " +
 		"FROM request_logs" + where
-	if err := db.QueryRow(statsSQL, args...).Scan(&total, &successCount, &totalTokens, &totalCost, &totalInputTokens, &totalCachedTokens); err != nil {
+	if err := db.QueryRow(statsSQL, args...).Scan(&total, &successCount, &totalTokens, &totalCost, &effectiveInputTokens, &totalCachedTokens); err != nil {
 		return LogStats{}, fmt.Errorf("usage: stats query: %w", err)
 	}
 
@@ -603,16 +612,11 @@ func QueryStats(params LogQueryParams) (LogStats, error) {
 		successRate = float64(successCount) / float64(total) * 100
 	}
 
-	var cacheRate float64
-	if totalInputTokens > 0 {
-		cacheRate = float64(totalCachedTokens) / float64(totalInputTokens) * 100
-	}
-
 	return LogStats{
 		Total:       total,
 		SuccessRate: successRate,
 		TotalTokens: totalTokens,
-		CacheRate:   cacheRate,
+		CacheRate:   cacheRateFromTokenTotals(effectiveInputTokens, totalCachedTokens),
 		TotalCost:   totalCost,
 	}, nil
 }
@@ -841,20 +845,20 @@ func QueryDashboardKPI(days int) (DashboardKPI, error) {
 	cutoff := CutoffStartUTC(days).Format(time.RFC3339)
 
 	var kpi DashboardKPI
-	err := db.QueryRow(`
-		SELECT
-			COUNT(*),
-			COALESCE(SUM(CASE WHEN failed=0 THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN failed=1 THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(input_tokens), 0),
-			COALESCE(SUM(output_tokens), 0),
-			COALESCE(SUM(reasoning_tokens), 0),
-			COALESCE(SUM(cached_tokens), 0),
-			COALESCE(SUM(total_tokens), 0),
-			COALESCE(SUM(cost), 0)
-		FROM request_logs
-		WHERE timestamp >= ?
-	`, cutoff).Scan(
+	var effectiveInputTokens int64
+	kpiSQL := "SELECT " +
+		"COUNT(*), " +
+		"COALESCE(SUM(CASE WHEN failed=0 THEN 1 ELSE 0 END), 0), " +
+		"COALESCE(SUM(CASE WHEN failed=1 THEN 1 ELSE 0 END), 0), " +
+		"COALESCE(SUM(input_tokens), 0), " +
+		"COALESCE(SUM(output_tokens), 0), " +
+		"COALESCE(SUM(reasoning_tokens), 0), " +
+		"COALESCE(SUM(cached_tokens), 0), " +
+		"COALESCE(SUM(total_tokens), 0), " +
+		"COALESCE(SUM(cost), 0), " +
+		"COALESCE(SUM(" + cacheRateEffectiveInputSQL + "), 0) " +
+		"FROM request_logs WHERE timestamp >= ?"
+	err := db.QueryRow(kpiSQL, cutoff).Scan(
 		&kpi.TotalRequests,
 		&kpi.SuccessRequests,
 		&kpi.FailedRequests,
@@ -864,6 +868,7 @@ func QueryDashboardKPI(days int) (DashboardKPI, error) {
 		&kpi.CachedTokens,
 		&kpi.TotalTokens,
 		&kpi.TotalCost,
+		&effectiveInputTokens,
 	)
 	if err != nil {
 		return DashboardKPI{}, fmt.Errorf("usage: dashboard KPI query: %w", err)
@@ -872,13 +877,7 @@ func QueryDashboardKPI(days int) (DashboardKPI, error) {
 	if kpi.TotalRequests > 0 {
 		kpi.SuccessRate = float64(kpi.SuccessRequests) / float64(kpi.TotalRequests) * 100
 	}
-	if kpi.InputTokens > 0 {
-		effectiveInput := kpi.InputTokens
-		if kpi.CachedTokens > kpi.InputTokens {
-			effectiveInput = kpi.InputTokens + kpi.CachedTokens
-		}
-		kpi.CacheRate = float64(kpi.CachedTokens) / float64(effectiveInput) * 100
-	}
+	kpi.CacheRate = cacheRateFromTokenTotals(effectiveInputTokens, kpi.CachedTokens)
 
 	return kpi, nil
 }
