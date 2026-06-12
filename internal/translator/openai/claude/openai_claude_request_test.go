@@ -588,3 +588,96 @@ func TestConvertClaudeRequestToOpenAI_AssistantThinkingToolUseThinkingSplit(t *t
 		t.Fatalf("Expected reasoning_content %q, got %q", "t1\n\nt2", got)
 	}
 }
+
+func TestConvertClaudeRequestToOpenAI_SkipsEmptyToolUseAndMatchingToolResult(t *testing.T) {
+	inputJSON := `{
+		"model": "claude-3-opus",
+		"messages": [
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "tool_use", "id": "call_empty", "name": "", "input": {"path": "x"}}
+				]
+			},
+			{
+				"role": "user",
+				"content": [
+					{"type": "tool_result", "tool_use_id": "call_empty", "content": "orphan result"}
+				]
+			}
+		]
+	}`
+
+	result := ConvertClaudeRequestToOpenAI("test-model", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+	messages := resultJSON.Get("messages").Array()
+	for _, msg := range messages {
+		if msg.Get("tool_calls").Exists() {
+			t.Fatalf("empty-name tool_use must not become OpenAI tool_calls: %s", result)
+		}
+		if msg.Get("role").String() == "tool" && msg.Get("tool_call_id").String() == "call_empty" {
+			t.Fatalf("tool_result for skipped tool_use must not become orphan tool message: %s", result)
+		}
+	}
+}
+
+func TestConvertClaudeRequestToOpenAI_ValidToolUseKeepsMatchingToolResult(t *testing.T) {
+	inputJSON := `{
+		"model": "claude-3-opus",
+		"messages": [
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "tool_use", "id": "call_valid", "name": "Read", "input": {"file_path": "a.go"}}
+				]
+			},
+			{
+				"role": "user",
+				"content": [
+					{"type": "tool_result", "tool_use_id": "call_valid", "content": "package a"}
+				]
+			}
+		]
+	}`
+
+	result := ConvertClaudeRequestToOpenAI("test-model", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+	messages := resultJSON.Get("messages").Array()
+	if len(messages) != 2 {
+		t.Fatalf("Expected assistant tool_calls + tool result, got %d: %s", len(messages), result)
+	}
+	if got := messages[0].Get("tool_calls.0.function.name").String(); got != "Read" {
+		t.Fatalf("Expected valid tool_call name Read, got %q: %s", got, result)
+	}
+	if got := messages[1].Get("role").String(); got != "tool" {
+		t.Fatalf("Expected second message role tool, got %q: %s", got, result)
+	}
+	if got := messages[1].Get("tool_call_id").String(); got != "call_valid" {
+		t.Fatalf("Expected matching tool_call_id call_valid, got %q: %s", got, result)
+	}
+}
+
+func TestConvertClaudeRequestToOpenAI_SkipsEmptyToolsAndDowngradesEmptyToolChoice(t *testing.T) {
+	inputJSON := `{
+		"model": "claude-3-opus",
+		"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+		"tools": [
+			{"name": "", "description": "empty", "input_schema": {"type": "object"}},
+			{"name": "   ", "description": "blank", "input_schema": {"type": "object"}},
+			{"name": "Read", "description": "read a file", "input_schema": {"type": "object"}}
+		],
+		"tool_choice": {"type": "tool", "name": "   "}
+	}`
+
+	result := ConvertClaudeRequestToOpenAI("test-model", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+	if got := resultJSON.Get("tools.#").Int(); got != 1 {
+		t.Fatalf("Expected exactly one non-empty tool definition, got %d: %s", got, result)
+	}
+	if got := resultJSON.Get("tools.0.function.name").String(); got != "Read" {
+		t.Fatalf("Expected preserved tool name Read, got %q: %s", got, result)
+	}
+	if got := resultJSON.Get("tool_choice").String(); got != "auto" {
+		t.Fatalf("Expected empty tool_choice name to downgrade to auto, got %q: %s", got, result)
+	}
+}
